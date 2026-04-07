@@ -1,0 +1,477 @@
+Below is your complete, copy-paste ready implementation document (MD file).
+
+⸻
+
+:::writing{variant=“standard” id=“48291”}
+
+🧵 TKT — Image Optimization & Resize System (HotLapHQ)
+
+⸻
+
+🎯 Objective
+
+Reduce page weight from ~20MB → <3MB by:
+	•	Serving correctly sized images
+	•	Avoiding full-resolution downloads
+	•	Using CloudFront caching
+	•	Generating images on-demand (once)
+	•	Persisting resized images in S3
+
+⸻
+
+🧠 Final Architecture
+
+Flow
+
+Browser
+  ↓
+CloudFront (cache)
+  ↓
+S3 (derived images)
+  ↓ (if 404)
+Lambda (Sharp)
+  ↓
+S3 (store generated images)
+  ↓
+CloudFront caches
+
+
+⸻
+
+📦 S3 Structure
+
+Bucket:
+
+thisisformulaone-media-library
+
+Structure:
+
+library/
+  articles/foo.jpg
+
+derived/
+  w80/articles/foo.jpg
+  w300/articles/foo.jpg
+  w400/articles/foo.jpg
+  w800/articles/foo.jpg
+  w1200/articles/foo.jpg
+
+
+⸻
+
+📏 Image Sizes (FINAL)
+
+w80   → thumbnails (80x60)
+w300  → small UI (dropdown, opinion)
+w400  → cards, sidebar
+w800  → article / breaking news
+w1200 → hero / HD
+
+
+⸻
+
+⚙️ Lambda Behavior
+
+When ANY size is requested and missing:
+	•	Fetch original from /library/
+	•	Generate ALL missing sizes
+	•	Store in /derived/
+	•	Return requested size
+
+⸻
+
+🐳 Lambda Setup (Container with Sharp)
+
+Step 1 — Create folder
+
+image-resizer/
+  index.js
+  package.json
+  Dockerfile
+
+
+⸻
+
+Step 2 — package.json
+
+{
+  "name": "image-resizer",
+  "version": "1.0.0",
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.0.0",
+    "sharp": "^0.33.0"
+  }
+}
+
+
+⸻
+
+Step 3 — Lambda Code (index.js)
+
+import { S3Client, GetObjectCommand, PutObjectCommand, HeadObjectCommand } from "@aws-sdk/client-s3";
+import sharp from "sharp";
+
+const s3 = new S3Client({});
+
+const BUCKET = process.env.BUCKET;
+
+const SIZES = {
+  w80: 80,
+  w300: 300,
+  w400: 400,
+  w800: 800,
+  w1200: 1200
+};
+
+export const handler = async (event) => {
+  try {
+    const path = event.rawPath || event.path;
+
+    // Example: /derived/w400/articles/foo.jpg
+    const match = path.match(/derived\/(w\d+)\/(.+)/);
+
+    if (!match) {
+      return { statusCode: 400, body: "Invalid path" };
+    }
+
+    const sizeKey = match[1];
+    const imagePath = match[2];
+
+    const width = SIZES[sizeKey];
+
+    const originalKey = `library/${imagePath}`;
+
+    // Fetch original
+    const original = await s3.send(
+      new GetObjectCommand({
+        Bucket: BUCKET,
+        Key: originalKey
+      })
+    );
+
+    const buffer = await streamToBuffer(original.Body);
+
+    // Generate missing sizes
+    await Promise.all(
+      Object.entries(SIZES).map(async ([key, w]) => {
+        const derivedKey = `derived/${key}/${imagePath}`;
+
+        try {
+          // Check if exists
+          await s3.send(
+            new HeadObjectCommand({
+              Bucket: BUCKET,
+              Key: derivedKey
+            })
+          );
+          return; // exists
+        } catch {}
+
+        const resized = await sharp(buffer)
+          .resize({ width: w })
+          .jpeg({ quality: 75 })
+          .toBuffer();
+
+        await s3.send(
+          new PutObjectCommand({
+            Bucket: BUCKET,
+            Key: derivedKey,
+            Body: resized,
+            ContentType: "image/jpeg",
+            CacheControl: "public, max-age=31536000, immutable"
+          })
+        );
+      })
+    );
+
+    // Return requested image
+    const finalKey = `derived/${sizeKey}/${imagePath}`;
+
+    const final = await s3.send(
+      new GetObjectCommand({
+        Bucket: BUCKET,
+        Key: finalKey
+      })
+    );
+
+    const finalBuffer = await streamToBuffer(final.Body);
+
+    return {
+      statusCode: 200,
+      headers: {
+        "Content-Type": "image/jpeg",
+        "Cache-Control": "public, max-age=31536000, immutable"
+      },
+      body: finalBuffer.toString("base64"),
+      isBase64Encoded: true
+    };
+  } catch (err) {
+    console.error(err);
+    return { statusCode: 500, body: "Error processing image" };
+  }
+};
+
+const streamToBuffer = async (stream) => {
+  const chunks = [];
+  for await (const chunk of stream) {
+    chunks.push(chunk);
+  }
+  return Buffer.concat(chunks);
+};
+
+
+⸻
+
+Step 4 — Dockerfile
+
+FROM public.ecr.aws/lambda/nodejs:20
+
+WORKDIR /var/task
+
+COPY package.json .
+RUN npm install
+
+COPY index.js .
+
+CMD ["index.handler"]
+
+
+⸻
+
+Step 5 — Build & Push
+
+docker build -t image-resizer .
+aws ecr create-repository --repository-name image-resizer
+
+docker tag image-resizer:latest <ECR_URL>:latest
+docker push <ECR_URL>:latest
+
+
+⸻
+
+Step 6 — Create Lambda
+	•	Runtime: Container
+	•	Memory: 1024MB
+	•	Timeout: 10 sec
+	•	Env:
+
+BUCKET=thisisformulaone-media-library
+
+
+
+⸻
+
+Step 7 — IAM Permissions
+
+Allow:
+	•	s3:GetObject
+	•	s3:PutObject
+	•	s3:HeadObject
+
+⸻
+
+🌐 CloudFront Setup
+
+Behavior
+
+/derived/* → S3
+
+Error Handling
+
+404 → redirect to Lambda (via API Gateway)
+
+⸻
+
+🧠 Frontend Implementation
+
+⸻
+
+Helper Function
+
+function getImage(url, size = "w400") {
+  return url.replace("/library/", `/derived/${size}/`);
+}
+
+
+⸻
+
+Usage
+
+Thumbnail
+
+<img src="${getImage(img, 'w80')}" loading="lazy">
+
+
+⸻
+
+Cards
+
+<img src="${getImage(img, 'w400')}" loading="lazy">
+
+
+⸻
+
+Article
+
+<img src="${getImage(img, 'w800')}" loading="lazy">
+
+
+⸻
+
+Hero
+
+<img src="${getImage(img, 'w1200')}" loading="lazy">
+
+
+⸻
+
+⚡ Lazy Loading (MANDATORY)
+
+<img loading="lazy">
+
+
+⸻
+
+🚀 Optional (Future)
+	•	WebP / AVIF
+	•	srcset
+	•	DPR support
+
+⸻
+
+✅ Final Outcome
+	•	20MB → 2–4MB
+	•	5–10x faster
+	•	better SEO
+	•	lower bandwidth
+	•	scalable system
+
+⸻
+
+🔥 Key Rule
+
+Resize ONCE → Store → Serve forever
+
+
+⸻
+
+:::
+
+⸻
+
+If you want next, I can also give you:
+	•	exact CloudFront 404 → Lambda wiring (step-by-step UI clicks)
+	•	or Terraform / CDK version of this setup
+
+Just tell me.
+
+-----------------
+
+Got it 👍 — here is the exact final, no-confusion version.
+
+⸻
+
+✅ STEP 1 — Create ECR Repository
+
+Run:
+
+aws ecr create-repository \
+  --repository-name image-resizer \
+  --region ap-southeast-2 \
+  --profile dev
+
+👉 Output will contain:
+
+repositoryUri: 123456789012.dkr.ecr.ap-southeast-2.amazonaws.com/image-resizer
+
+👉 THIS is your ECR URL
+
+⸻
+
+✅ STEP 2 — Save your ECR URL
+
+Example:
+
+ECR_URL=123456789012.dkr.ecr.ap-southeast-2.amazonaws.com/image-resizer
+
+(Replace with your actual value)
+
+⸻
+
+✅ STEP 3 — Build Docker Image
+
+docker build -t image-resizer .
+
+
+⸻
+
+✅ STEP 4 — Tag Image
+
+docker tag image-resizer:latest $ECR_URL:latest
+
+
+⸻
+
+✅ STEP 5 — Login to ECR (IMPORTANT)
+
+aws ecr get-login-password \
+  --region ap-southeast-2 \
+  --profile dev | docker login \
+  --username AWS \
+  --password-stdin 123456789012.dkr.ecr.ap-southeast-2.amazonaws.com
+
+👉 Replace account ID if different
+
+⸻
+
+🧠 What is this | (pipe)?
+
+👉 It means:
+	•	AWS command generates password
+	•	It is directly passed into Docker login
+
+👉 You don’t see the password manually
+
+⸻
+
+✅ STEP 6 — Push Image
+
+docker push $ECR_URL:latest
+
+
+⸻
+
+🎯 DONE
+
+Now go to AWS Lambda:
+	•	Create function → Container image
+	•	Paste:
+
+$ECR_URL:latest
+
+
+⸻
+
+🔥 SIMPLE SUMMARY
+
+# 1. Create repo
+aws ecr create-repository ...
+
+# 2. Build
+docker build -t image-resizer .
+
+# 3. Tag
+docker tag image-resizer:latest <ECR_URL>:latest
+
+# 4. Login
+aws ecr get-login-password ... | docker login ...
+
+# 5. Push
+docker push <ECR_URL>:latest
+
+
+⸻
+
+If you want next:
+
+👉 I’ll give you Lambda creation exact settings (click-by-click)
